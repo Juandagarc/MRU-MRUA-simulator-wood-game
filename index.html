@@ -1,0 +1,1126 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1.0" />
+<title>Simulador Cinemática · Sika</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    width: 100%; height: 100%;
+    background: radial-gradient(ellipse at 50% 0%, #463978 0%, #251c40 60%, #0f0c1c 100%);
+    font-family: "Trebuchet MS", system-ui, sans-serif;
+    overflow: hidden;
+    color: #fbf6e8;
+  }
+  #stage {
+    position: fixed; inset: 0;
+    display: grid; place-items: center;
+    padding: 14px;
+  }
+  canvas {
+    width: min(98vw, calc(96vh * 1.6));
+    height: auto;
+    aspect-ratio: 1280 / 800;
+    box-shadow: 0 30px 80px rgba(0,0,0,0.55), 0 8px 20px rgba(0,0,0,0.35);
+    border-radius: 22px;
+    cursor: default;
+    touch-action: none;
+    user-select: none;
+  }
+  #hint {
+    position: fixed; bottom: 6px; left: 50%; transform: translateX(-50%);
+    font-size: 12px; opacity: .55; letter-spacing: .04em;
+    pointer-events: none; text-shadow: 0 1px 2px rgba(0,0,0,.4);
+  }
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <canvas id="game" width="1280" height="800"></canvas>
+</div>
+<div id="hint">Arrastra las piezas a la gráfica · doble clic fuera para reiniciar</div>
+
+<script>
+"use strict";
+
+/* =================================================================
+ *  Simulador Cinemática · Posición vs. Tiempo  (Sika)
+ *  Réplica del juego didáctico de madera.
+ *
+ *      ┌──────────────┐  estado inmutable  ┌──────────────────┐
+ *      │ StateManager ├───────────────────▶│  CanvasRenderer  │
+ *      └──────┬───────┘                    └──────────────────┘
+ *             ▲                                      ▲
+ *             │ mutaciones                           │ pinta @ 60fps
+ *      ┌──────┴───────┐                    ┌─────────┴──────────┐
+ *      │ InputHandler │                    │     MathEngine     │
+ *      └──────────────┘                    └────────────────────┘
+ *
+ *  Tipos (TS-style en JSDoc):
+ *   @typedef {Object} Point     { t:number, x:number }
+ *   @typedef {Object} PieceTpl  { id, shape, a, dur, label, posSpan }
+ *   @typedef {Object} Piece     { id, tplId, slotIdx, t?, x? }
+ * ================================================================= */
+
+/* ─── 1. CONFIG (sin números mágicos) ─────────────────────────── */
+const CFG = Object.freeze({
+  CANVAS:  { W: 1280, H: 800 },
+  BOARD:   { PAD: 22, R: 22 },
+
+  /* Escala física única — la misma en gráfica y en inventario */
+  SCALE:   { PX_PER_SEC: 8, PX_PER_METER: 1.2 },
+
+  GRAPH:   {
+    LEFT: 108, TOP: 90, RIGHT: 668, BOTTOM: 690,
+    T_MIN: 0,   T_MAX: 70,
+    X_MIN: -50, X_MAX: 450,
+    T_MAJOR: 10, X_MAJOR: 50,
+    T_MINORS: 5, X_MINORS: 5
+  },
+  INV:     { LEFT: 696, TOP: 90, RIGHT: 1240, BOTTOM: 690 },
+
+  TILE:    { PAD_PX: 4, MIN_INNER_H: 26, INK_W: 2.4, BORDER: 1.4 },
+  SNAP:    { T: 10, X: 50, JOIN_TOL_PX: 30 },
+  HIT_PAD: 4,
+
+  COLORS:  {
+    BG_OUTSIDE:  "#1a162e",
+    /* Marco - madera de roble claro tipo tablero del juego */
+    WOOD_HI:     "#e9cb96",
+    WOOD_MID:    "#d2ad75",
+    WOOD_LO:     "#b3884e",
+    WOOD_BOT:    "#94693a",
+    WOOD_EDGE:   "#5e3a1a",
+    GRAIN_DARK:  "rgba(80,46,18,0.13)",
+    GRAIN_DEEP:  "rgba(60,32,12,0.18)",
+    SCREW_HI:    "#dde4eb",
+    SCREW_LO:    "#5d6e80",
+    /* Papel cuadriculado */
+    PAPER:       "#f7f1de",
+    PAPER_EDGE:  "#cdb992",
+    GRID_MAJOR:  "rgba(82,52,22,0.55)",
+    GRID_MINOR:  "rgba(140,100,55,0.22)",
+    AXIS:        "#2a1a0c",
+    INK:         "#1c1108",
+    INK_SOFT:    "#3a2818",
+    /* Bloque de madera (un poco más cálido que el marco) */
+    BLOCK_TOP:   "#eed1a0",
+    BLOCK_MID:   "#dab784",
+    BLOCK_BOT:   "#bb9560",
+    BLOCK_EDGE:  "#7a4f25",
+    BLOCK_HI:    "rgba(255,238,205,0.55)",
+    SLOT_HOLE_T: "rgba(35,18,6,0.55)",
+    SLOT_HOLE_B: "rgba(85,52,22,0.4)",
+    SLOT_RIM:    "rgba(40,22,8,0.7)",
+    HIGHLIGHT:   "rgba(255,205,90,0.85)",
+    DROP_OK:     "rgba(70,180,90,0.32)",
+    DROP_NO:     "rgba(210,80,70,0.32)",
+    JOINT_OK:    "#2da94f",
+    JOINT_BAD:   "#d3473d"
+  }
+});
+
+/* ─── 2. PLANTILLAS DE PIEZAS  (con tamaño físico real) ───────── */
+/* posSpan = Δx neto (en metros) — define la altura del bloque */
+const TEMPLATES = Object.freeze({
+  Q_NEG_2: { id:"Q_NEG_2", shape:"quadratic", a:-2,  dur:10, label:"X=−2t²", posSpan:-200 },
+  Q_POS_2: { id:"Q_POS_2", shape:"quadratic", a: 2,  dur:10, label:"X=2t²",  posSpan: 200 },
+  Q_NEG_1: { id:"Q_NEG_1", shape:"quadratic", a:-1,  dur:10, label:"X=−t²",  posSpan:-100 },
+  Q_POS_1: { id:"Q_POS_1", shape:"quadratic", a: 1,  dur:10, label:"X=t²",   posSpan: 100 },
+  /* Lineales del juego (slope ±20 → cubren misma altura que ±2t²) */
+  L_POS:   { id:"L_POS",   shape:"linear",    a: 20, dur:10, label:"",       posSpan: 200 },
+  L_NEG:   { id:"L_NEG",   shape:"linear",    a:-20, dur:10, label:"",       posSpan:-200 },
+  HORIZ:   { id:"HORIZ",   shape:"horizontal",a: 0,  dur:10, label:"",       posSpan:   0 }
+});
+
+/* Layout EXACTO del juego de madera (ver imagen):
+ *  5 columnas × 2 mitades — alturas variables.            */
+const INVENTORY_SPEC = [
+  /* col, row, tplId  — top half */
+  { c:0, h:"top",    t:"Q_NEG_2" },
+  { c:1, h:"top",    t:"Q_NEG_2" },
+  { c:2, h:"top",    t:"Q_POS_2" },
+  /* 2x2 de cuadráticas pequeñas */
+  { c:3, h:"top-up", t:"Q_POS_1" },
+  { c:4, h:"top-up", t:"Q_POS_1" },
+  { c:3, h:"top-dn", t:"Q_NEG_1" },
+  { c:4, h:"top-dn", t:"Q_NEG_1" },
+  /* bottom half */
+  { c:0, h:"bot",    t:"L_POS"   },
+  { c:1, h:"bot",    t:"L_NEG"   },
+  { c:2, h:"bot",    t:"Q_POS_2" },
+  /* mix derecha-abajo: 1 cuadrática + 2 horizontales por columna */
+  { c:3, h:"bot-up", t:"Q_NEG_1" },
+  { c:4, h:"bot-up", t:"Q_POS_1" },
+  { c:3, h:"bot-h1", t:"HORIZ"   },
+  { c:4, h:"bot-h1", t:"HORIZ"   },
+  { c:3, h:"bot-h2", t:"HORIZ"   },
+  { c:4, h:"bot-h2", t:"HORIZ"   }
+];
+
+/* ─── 3. UTILS ────────────────────────────────────────────────── */
+function roundRectPath(ctx, x, y, w, h, r) {
+  const rr = Math.min(r, w * .5, h * .5);
+  ctx.beginPath();
+  ctx.moveTo(x + rr, y);
+  ctx.lineTo(x + w - rr, y);
+  ctx.arcTo(x + w, y, x + w, y + rr, rr);
+  ctx.lineTo(x + w, y + h - rr);
+  ctx.arcTo(x + w, y + h, x + w - rr, y + h, rr);
+  ctx.lineTo(x + rr, y + h);
+  ctx.arcTo(x, y + h, x, y + h - rr, rr);
+  ctx.lineTo(x, y + rr);
+  ctx.arcTo(x, y, x + rr, y, rr);
+  ctx.closePath();
+}
+function pointInRect(p, r) {
+  return p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
+}
+function makeSeededRng(seed) {
+  let s = seed | 0;
+  return () => { s = (s * 9301 + 49297) % 233280; return s / 233280; };
+}
+
+/* ─── 4. MATH ENGINE ──────────────────────────────────────────── */
+class MathEngine {
+  static delta(tpl, dt) {
+    if (tpl.shape === "quadratic") return tpl.a * dt * dt;
+    if (tpl.shape === "linear")    return tpl.a * dt;
+    return 0;
+  }
+  static endDelta(tpl) { return MathEngine.delta(tpl, tpl.dur); }
+  static end(piece, tpl) {
+    return { t: piece.t + tpl.dur, x: piece.x + MathEngine.endDelta(tpl) };
+  }
+  static samples(piece, tpl, n = 32) {
+    const out = new Array(n + 1);
+    for (let i = 0; i <= n; i++) {
+      const dt = (tpl.dur * i) / n;
+      out[i] = { t: piece.t + dt, x: piece.x + MathEngine.delta(tpl, dt) };
+    }
+    return out;
+  }
+  static continuity(boardPieces) {
+    if (boardPieces.length === 0) return { ok: true, joints: [], pieces: 0 };
+    const sorted = [...boardPieces].sort((a, b) => a.t - b.t);
+    const joints = [];
+    let ok = true;
+    for (let i = 1; i < sorted.length; i++) {
+      const prev = sorted[i - 1], next = sorted[i];
+      const e = MathEngine.end(prev, TEMPLATES[prev.tplId]);
+      const aligned = Math.abs(e.t - next.t) < 1e-3 && Math.abs(e.x - next.x) < 1e-3;
+      joints.push({ at: { t: next.t, x: next.x }, ok: aligned });
+      if (!aligned) ok = false;
+    }
+    return { ok, joints, pieces: boardPieces.length };
+  }
+}
+
+/* ─── 5. STATE MANAGER ───────────────────────────────────────── */
+class StateManager {
+  constructor() {
+    /** @type {Piece[]} */ this.inventory = [];
+    /** @type {Piece[]} */ this.board = [];
+    this.drag = null;
+    this.dirty = true;
+    this._init();
+  }
+  _init() {
+    INVENTORY_SPEC.forEach((spec, idx) => {
+      this.inventory.push({ id: `p${idx}`, tplId: spec.t, slotIdx: idx });
+    });
+  }
+  markDirty() { this.dirty = true; }
+
+  pickupInv(piece, mx, my, gx, gy) {
+    this.inventory = this.inventory.filter(p => p.id !== piece.id);
+    this.drag = { piece, fromBoard: false, gx, gy, mouseX: mx, mouseY: my, snap: null };
+    this.markDirty();
+  }
+  pickupBoard(piece, mx, my, gx, gy) {
+    this.board = this.board.filter(p => p.id !== piece.id);
+    this.drag = { piece, fromBoard: true, gx, gy, mouseX: mx, mouseY: my, snap: null };
+    this.markDirty();
+  }
+  setDragMouse(mx, my, snap = null) {
+    if (!this.drag) return;
+    this.drag.mouseX = mx; this.drag.mouseY = my; this.drag.snap = snap;
+    this.markDirty();
+  }
+  placeBoard(t, x) {
+    if (!this.drag) return;
+    this.board.push({ ...this.drag.piece, t, x });
+    this.drag = null;
+    this.markDirty();
+  }
+  returnInv() {
+    if (!this.drag) return;
+    this.inventory.push(this.drag.piece);
+    this.drag = null;
+    this.markDirty();
+  }
+  resetAll() {
+    if (this.drag) this.returnInv();
+    for (const p of this.board) {
+      this.inventory.push({ id: p.id, tplId: p.tplId, slotIdx: p.slotIdx });
+    }
+    this.board = [];
+    this.markDirty();
+  }
+}
+
+/* ─── 6. CANVAS RENDERER ─────────────────────────────────────── */
+class CanvasRenderer {
+  constructor(canvas, state) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext("2d");
+    this.state = state;
+    this.bgLayer = this._buildBackgroundLayer();
+    this.slots = this._buildInventorySlots();
+  }
+
+  /* 6.1 Escalas / coordenadas */
+  get pxPerSec()   { return CFG.SCALE.PX_PER_SEC;   }
+  get pxPerMeter() { return CFG.SCALE.PX_PER_METER; }
+
+  tToPx(t) { return CFG.GRAPH.LEFT  + (t - CFG.GRAPH.T_MIN) * this.pxPerSec; }
+  xToPy(x) { return CFG.GRAPH.BOTTOM - (x - CFG.GRAPH.X_MIN) * this.pxPerMeter; }
+  pxToT(p) { return CFG.GRAPH.T_MIN + (p - CFG.GRAPH.LEFT) / this.pxPerSec; }
+  pyToX(p) { return CFG.GRAPH.X_MIN + (CFG.GRAPH.BOTTOM - p) / this.pxPerMeter; }
+
+  tileOuterSize(tpl) {
+    const PAD = CFG.TILE.PAD_PX;
+    const innerW = tpl.dur * this.pxPerSec;
+    const innerH = Math.max(CFG.TILE.MIN_INNER_H, Math.abs(tpl.posSpan) * this.pxPerMeter);
+    return { w: innerW + 2 * PAD, h: innerH + 2 * PAD, innerW, innerH };
+  }
+  tileAnchorOffset(tpl) {
+    const PAD = CFG.TILE.PAD_PX;
+    const sz = this.tileOuterSize(tpl);
+    const endDx = MathEngine.endDelta(tpl);
+    let dy;
+    if (Math.abs(endDx) < 1e-6) dy = sz.h / 2;       // horizontal: centro vertical
+    else if (endDx > 0)         dy = sz.h - PAD;     // sube → arranca abajo
+    else                        dy = PAD;            // baja → arranca arriba
+    return { dx: PAD, dy };
+  }
+
+  /* 6.2 INVENTARIO — replica del tablero de madera (5 columnas, 2 mitades) */
+  _buildInventorySlots() {
+    const COLS = 5;
+    const tileW = TEMPLATES.HORIZ.dur * this.pxPerSec + 2 * CFG.TILE.PAD_PX;
+    const innerW = CFG.INV.RIGHT - CFG.INV.LEFT;
+    const innerH = CFG.INV.BOTTOM - CFG.INV.TOP;
+    const gapH = (innerW - tileW * COLS) / (COLS + 1);
+
+    const halfH = innerH / 2;
+    const topY  = CFG.INV.TOP;
+    const botY  = CFG.INV.TOP + halfH;
+
+    /* alturas exteriores de cada plantilla */
+    const sz = {};
+    for (const id in TEMPLATES) sz[id] = this.tileOuterSize(TEMPLATES[id]);
+
+    /* Calcular X de cada columna */
+    const colX = (c) => CFG.INV.LEFT + gapH + c * (tileW + gapH);
+
+    /* Para cada slot, calcular su rectángulo */
+    const slots = INVENTORY_SPEC.map((spec) => {
+      const tpl = TEMPLATES[spec.t];
+      const s = sz[spec.t];
+      let x = colX(spec.c), y, w = s.w, h = s.h;
+
+      switch (spec.h) {
+        case "top": {  /* pieza alta del top half (centrada en su mitad) */
+          y = topY + (halfH - s.h) / 2;
+          break;
+        }
+        case "bot": {  /* pieza alta del bottom half */
+          y = botY + (halfH - s.h) / 2;
+          break;
+        }
+        case "top-up": {  /* cuadrícula 2×2 — celda superior */
+          const totalH = sz.Q_POS_1.h * 2 + 6;          // 6px gap entre las dos
+          const startY = topY + (halfH - totalH) / 2;
+          y = startY;
+          break;
+        }
+        case "top-dn": {  /* cuadrícula 2×2 — celda inferior */
+          const totalH = sz.Q_POS_1.h * 2 + 6;
+          const startY = topY + (halfH - totalH) / 2;
+          y = startY + sz.Q_POS_1.h + 6;
+          break;
+        }
+        case "bot-up": {  /* mix derecha-abajo: cuadrícula arriba */
+          const oneSmall = sz.Q_POS_1.h;
+          const oneHorz  = sz.HORIZ.h;
+          const totalH = oneSmall + 6 + oneHorz + 4 + oneHorz;
+          const startY = botY + (halfH - totalH) / 2;
+          y = startY;
+          break;
+        }
+        case "bot-h1": {
+          const oneSmall = sz.Q_POS_1.h;
+          const oneHorz  = sz.HORIZ.h;
+          const totalH = oneSmall + 6 + oneHorz + 4 + oneHorz;
+          const startY = botY + (halfH - totalH) / 2;
+          y = startY + oneSmall + 6;
+          break;
+        }
+        case "bot-h2": {
+          const oneSmall = sz.Q_POS_1.h;
+          const oneHorz  = sz.HORIZ.h;
+          const totalH = oneSmall + 6 + oneHorz + 4 + oneHorz;
+          const startY = botY + (halfH - totalH) / 2;
+          y = startY + oneSmall + 6 + oneHorz + 4;
+          break;
+        }
+        default: y = topY;
+      }
+      return { idx: spec.idx, c: spec.c, half: spec.h, tplId: spec.t, x, y, w, h };
+    });
+    return slots;
+  }
+  slotForPiece(piece) { return this.slots[piece.slotIdx]; }
+  inventoryAnchor(piece) {
+    const s = this.slotForPiece(piece);
+    const off = this.tileAnchorOffset(TEMPLATES[piece.tplId]);
+    return { px: s.x + off.dx, py: s.y + off.dy };
+  }
+  boardAnchor(piece) { return { px: this.tToPx(piece.t), py: this.xToPy(piece.x) }; }
+  boardTileRect(piece) {
+    const tpl = TEMPLATES[piece.tplId];
+    const off = this.tileAnchorOffset(tpl);
+    const sz  = this.tileOuterSize(tpl);
+    const ax = this.tToPx(piece.t), ay = this.xToPy(piece.x);
+    return { x: ax - off.dx, y: ay - off.dy, w: sz.w, h: sz.h };
+  }
+
+  /* 6.3 Background pre-render (madera, tornillos, agujeros) */
+  _buildBackgroundLayer() {
+    const off = document.createElement("canvas");
+    off.width = CFG.CANVAS.W; off.height = CFG.CANVAS.H;
+    const c = off.getContext("2d");
+
+    c.fillStyle = CFG.COLORS.BG_OUTSIDE;
+    c.fillRect(0, 0, off.width, off.height);
+
+    const px = CFG.BOARD.PAD, py = CFG.BOARD.PAD;
+    const pw = off.width - 2 * px, ph = off.height - 2 * py;
+    this._paintWoodPanel(c, px, py, pw, ph, CFG.BOARD.R);
+
+    /* Tornillos en las 4 esquinas */
+    const inset = 36;
+    [[px+inset, py+inset], [px+pw-inset, py+inset],
+     [px+inset, py+ph-inset], [px+pw-inset, py+ph-inset]
+    ].forEach(([sx, sy]) => this._paintScrew(c, sx, sy, 14));
+
+    /* Agujeros decorativos en el borde superior central */
+    this._paintHole(c, px + pw * 0.5, py + 14, 7);
+
+    /* Encajes laterales tipo mortajas */
+    [
+      { x: px + 3,        y: py + ph * 0.5,  w: 8,  h: 22 },
+      { x: px + pw - 11,  y: py + ph * 0.5,  w: 8,  h: 22 },
+      { x: px + pw * 0.5 - 11, y: py + ph - 11, w: 22, h: 8 }
+    ].forEach(n => {
+      c.fillStyle = "rgba(35,18,6,0.7)";
+      roundRectPath(c, n.x, n.y - n.h/2, n.w, n.h, 3);
+      c.fill();
+    });
+
+    return off;
+  }
+
+  _paintWoodPanel(c, x, y, w, h, r) {
+    c.save();
+    roundRectPath(c, x, y, w, h, r);
+    c.clip();
+
+    const g = c.createLinearGradient(x, y, x, y + h);
+    g.addColorStop(0,    CFG.COLORS.WOOD_HI);
+    g.addColorStop(0.45, CFG.COLORS.WOOD_MID);
+    g.addColorStop(1,    CFG.COLORS.WOOD_LO);
+    c.fillStyle = g;
+    c.fillRect(x, y, w, h);
+
+    /* Veta — trazos verticales muy finos */
+    const rng = makeSeededRng(424242);
+    c.strokeStyle = CFG.COLORS.GRAIN_DARK; c.lineWidth = 1;
+    for (let i = 0; i < 200; i++) {
+      const lx = x + rng() * w, ly = y + rng() * h;
+      const len = 80 + rng() * 280;
+      const sway = (rng() - 0.5) * 12;
+      c.beginPath();
+      c.moveTo(lx, ly);
+      c.bezierCurveTo(lx + sway, ly + len * 0.33,
+                      lx - sway, ly + len * 0.66,
+                      lx + sway * 0.5, ly + len);
+      c.stroke();
+    }
+    c.strokeStyle = CFG.COLORS.GRAIN_DEEP; c.lineWidth = 1.4;
+    for (let i = 0; i < 22; i++) {
+      const lx = x + rng() * w, ly = y + rng() * h;
+      const len = 140 + rng() * 240;
+      c.beginPath();
+      c.moveTo(lx, ly);
+      c.bezierCurveTo(lx + 4, ly + len * 0.4,
+                      lx - 4, ly + len * 0.6,
+                      lx + 2, ly + len);
+      c.stroke();
+    }
+    /* Algunos nudos */
+    for (let i = 0; i < 4; i++) {
+      const kx = x + rng() * w, ky = y + rng() * h;
+      const kr = 8 + rng() * 14;
+      const rg = c.createRadialGradient(kx, ky, 1, kx, ky, kr);
+      rg.addColorStop(0,    "rgba(55,28,8,0.55)");
+      rg.addColorStop(0.45, "rgba(75,42,16,0.25)");
+      rg.addColorStop(1,    "rgba(75,42,16,0)");
+      c.fillStyle = rg;
+      c.beginPath(); c.arc(kx, ky, kr, 0, Math.PI * 2); c.fill();
+    }
+    /* Viñeteado suave */
+    const v = c.createRadialGradient(x + w/2, y + h/2, Math.min(w, h) * 0.35,
+                                     x + w/2, y + h/2, Math.max(w, h) * 0.7);
+    v.addColorStop(0, "rgba(0,0,0,0)");
+    v.addColorStop(1, "rgba(60,30,5,0.28)");
+    c.fillStyle = v;
+    c.fillRect(x, y, w, h);
+
+    c.restore();
+
+    /* Borde externo + chaflán brillante */
+    c.lineWidth = 3;
+    c.strokeStyle = CFG.COLORS.WOOD_EDGE;
+    roundRectPath(c, x + 0.5, y + 0.5, w - 1, h - 1, r);
+    c.stroke();
+    c.lineWidth = 1;
+    c.strokeStyle = "rgba(255,225,180,0.45)";
+    roundRectPath(c, x + 2.5, y + 2.5, w - 5, h - 5, r - 2);
+    c.stroke();
+  }
+
+  _paintScrew(c, cx, cy, r) {
+    const g0 = c.createRadialGradient(cx, cy + r * 0.2, r * 0.3, cx, cy, r * 1.4);
+    g0.addColorStop(0, "rgba(0,0,0,0.5)"); g0.addColorStop(1, "rgba(0,0,0,0)");
+    c.fillStyle = g0;
+    c.beginPath(); c.arc(cx, cy, r * 1.4, 0, Math.PI * 2); c.fill();
+
+    const g = c.createRadialGradient(cx - r*0.3, cy - r*0.4, 0, cx, cy, r);
+    g.addColorStop(0,    CFG.COLORS.SCREW_HI);
+    g.addColorStop(0.55, "#a4b4c2");
+    g.addColorStop(1,    CFG.COLORS.SCREW_LO);
+    c.fillStyle = g;
+    c.beginPath(); c.arc(cx, cy, r, 0, Math.PI * 2); c.fill();
+    c.strokeStyle = "rgba(20,30,40,0.7)"; c.lineWidth = 1; c.stroke();
+
+    /* ranura tipo Phillips */
+    c.strokeStyle = "rgba(20,30,40,0.85)"; c.lineWidth = 1.6;
+    c.beginPath();
+    c.moveTo(cx - r*0.55, cy); c.lineTo(cx + r*0.55, cy);
+    c.moveTo(cx, cy - r*0.55); c.lineTo(cx, cy + r*0.55);
+    c.stroke();
+  }
+
+  _paintHole(c, cx, cy, r) {
+    const g = c.createRadialGradient(cx, cy, 1, cx, cy, r * 1.6);
+    g.addColorStop(0, "#0c0703"); g.addColorStop(0.7, "#2a190c");
+    g.addColorStop(1, "rgba(60,32,12,0)");
+    c.fillStyle = g;
+    c.beginPath(); c.arc(cx, cy, r * 1.6, 0, Math.PI * 2); c.fill();
+    c.fillStyle = "#1a0d05";
+    c.beginPath(); c.arc(cx, cy, r, 0, Math.PI * 2); c.fill();
+  }
+
+  /* 6.4 PUNTO DE ENTRADA principal */
+  render() {
+    const c = this.ctx;
+    c.clearRect(0, 0, CFG.CANVAS.W, CFG.CANVAS.H);
+    c.drawImage(this.bgLayer, 0, 0);
+
+    this._drawTitle();
+    this._drawGraphPaper();
+    this._drawGrid();
+    this._drawAxes();
+    this._drawAxisLabels();
+    this._drawInventoryBackdrop();
+    this._drawInventoryEmptySlots();
+    this._drawInventoryPieces();
+    this._drawSnapPreview();
+    this._drawBoardPieces();
+    this._drawJoints();
+    this._drawDragGhost();
+    this._drawBranding();
+    this._drawHud();
+  }
+
+  _drawTitle() {
+    const c = this.ctx;
+    c.fillStyle = CFG.COLORS.INK;
+    c.font = "bold 16px Georgia, serif";
+    c.textAlign = "center"; c.textBaseline = "top";
+    c.fillText("GRÁFICA DE POSICIÓN VS. TIEMPO",
+               (CFG.GRAPH.LEFT + CFG.GRAPH.RIGHT) / 2, 50);
+  }
+
+  _drawGraphPaper() {
+    const c = this.ctx;
+    const { LEFT, TOP, RIGHT, BOTTOM } = CFG.GRAPH;
+    const w = RIGHT - LEFT, h = BOTTOM - TOP;
+    /* hueco (sombra) */
+    c.save();
+    c.shadowColor = "rgba(0,0,0,0.4)";
+    c.shadowBlur = 14; c.shadowOffsetY = 4;
+    c.fillStyle = "rgba(40,20,8,0.45)";
+    roundRectPath(c, LEFT - 5, TOP - 5, w + 10, h + 10, 5);
+    c.fill();
+    c.restore();
+    /* papel cuadriculado */
+    c.fillStyle = CFG.COLORS.PAPER;
+    c.fillRect(LEFT, TOP, w, h);
+    c.strokeStyle = CFG.COLORS.PAPER_EDGE; c.lineWidth = 1.5;
+    c.strokeRect(LEFT + 0.5, TOP + 0.5, w - 1, h - 1);
+  }
+
+  _drawGrid() {
+    const c = this.ctx;
+    const G = CFG.GRAPH;
+    const tStepMinor = G.T_MAJOR / G.T_MINORS;
+    const xStepMinor = G.X_MAJOR / G.X_MINORS;
+    c.strokeStyle = CFG.COLORS.GRID_MINOR; c.lineWidth = 0.6;
+    for (let t = G.T_MIN; t <= G.T_MAX + 1e-3; t += tStepMinor) {
+      const px = this.tToPx(t);
+      c.beginPath(); c.moveTo(px, G.TOP); c.lineTo(px, G.BOTTOM); c.stroke();
+    }
+    for (let x = G.X_MIN; x <= G.X_MAX + 1e-3; x += xStepMinor) {
+      const py = this.xToPy(x);
+      c.beginPath(); c.moveTo(G.LEFT, py); c.lineTo(G.RIGHT, py); c.stroke();
+    }
+    c.strokeStyle = CFG.COLORS.GRID_MAJOR; c.lineWidth = 1;
+    for (let t = G.T_MIN; t <= G.T_MAX + 1e-3; t += G.T_MAJOR) {
+      const px = this.tToPx(t);
+      c.beginPath(); c.moveTo(px, G.TOP); c.lineTo(px, G.BOTTOM); c.stroke();
+    }
+    for (let x = G.X_MIN; x <= G.X_MAX + 1e-3; x += G.X_MAJOR) {
+      const py = this.xToPy(x);
+      c.beginPath(); c.moveTo(G.LEFT, py); c.lineTo(G.RIGHT, py); c.stroke();
+    }
+  }
+
+  _drawAxes() {
+    const c = this.ctx;
+    const { LEFT, TOP, RIGHT, BOTTOM } = CFG.GRAPH;
+    const xZeroPy = this.xToPy(0);
+    c.strokeStyle = CFG.COLORS.AXIS; c.fillStyle = CFG.COLORS.AXIS;
+    c.lineWidth = 2; c.lineCap = "round";
+
+    /* eje Y */
+    const yAxisX = LEFT - 8;
+    c.beginPath();
+    c.moveTo(yAxisX, BOTTOM + 6); c.lineTo(yAxisX, TOP - 14);
+    c.stroke();
+    c.beginPath();
+    c.moveTo(yAxisX, TOP - 20);
+    c.lineTo(yAxisX - 5, TOP - 8);
+    c.lineTo(yAxisX + 5, TOP - 8);
+    c.closePath(); c.fill();
+
+    /* eje X (sobre x=0) */
+    c.beginPath();
+    c.moveTo(LEFT - 12, xZeroPy); c.lineTo(RIGHT + 22, xZeroPy);
+    c.stroke();
+    c.beginPath();
+    c.moveTo(RIGHT + 28, xZeroPy);
+    c.lineTo(RIGHT + 16, xZeroPy - 5);
+    c.lineTo(RIGHT + 16, xZeroPy + 5);
+    c.closePath(); c.fill();
+  }
+
+  _drawAxisLabels() {
+    const c = this.ctx;
+    const G = CFG.GRAPH;
+    const xZeroPy = this.xToPy(0);
+
+    c.fillStyle = CFG.COLORS.INK;
+    c.font = "11px Georgia, serif";
+    c.textAlign = "right"; c.textBaseline = "middle";
+    for (let x = G.X_MIN; x <= G.X_MAX + 1e-3; x += G.X_MAJOR) {
+      const py = this.xToPy(x);
+      c.fillText(String(x), G.LEFT - 14, py);
+      c.strokeStyle = CFG.COLORS.AXIS; c.lineWidth = 1.2;
+      c.beginPath(); c.moveTo(G.LEFT - 12, py); c.lineTo(G.LEFT - 4, py); c.stroke();
+    }
+    c.font = "italic bold 12px Georgia, serif";
+    c.textAlign = "left"; c.textBaseline = "bottom";
+    c.fillText("X(m)", G.LEFT - 22, G.TOP - 22);
+
+    c.font = "11px Georgia, serif";
+    c.textAlign = "center"; c.textBaseline = "top";
+    for (let t = G.T_MAJOR; t <= G.T_MAX + 1e-3; t += G.T_MAJOR) {
+      const px = this.tToPx(t);
+      c.fillText(String(t), px, xZeroPy + 6);
+      c.strokeStyle = CFG.COLORS.AXIS; c.lineWidth = 1.2;
+      c.beginPath(); c.moveTo(px, xZeroPy - 4); c.lineTo(px, xZeroPy + 4); c.stroke();
+    }
+    c.font = "italic bold 12px Georgia, serif";
+    c.textAlign = "left"; c.textBaseline = "middle";
+    c.fillText("t(s)", G.RIGHT + 32, xZeroPy);
+  }
+
+  /* 6.5 INVENTARIO */
+  _drawInventoryBackdrop() {
+    /* línea separadora vertical (groove) entre gráfica e inventario */
+    const c = this.ctx;
+    const { LEFT, TOP, BOTTOM } = CFG.INV;
+    const sx = LEFT - 14;
+    c.save();
+    c.strokeStyle = "rgba(40,22,8,0.55)"; c.lineWidth = 1;
+    c.beginPath(); c.moveTo(sx, TOP - 6); c.lineTo(sx, BOTTOM + 6); c.stroke();
+    c.strokeStyle = "rgba(255,220,170,0.18)";
+    c.beginPath(); c.moveTo(sx + 1.5, TOP - 6); c.lineTo(sx + 1.5, BOTTOM + 6); c.stroke();
+    c.restore();
+  }
+
+  _drawInventoryEmptySlots() {
+    const occupied = new Set();
+    for (const p of this.state.inventory) occupied.add(p.slotIdx);
+    const c = this.ctx;
+    for (const slot of this.slots) {
+      if (occupied.has(slot.idx === undefined
+          ? this.slots.indexOf(slot) : slot.idx)) continue;
+      /* fall-back: comparar por referencia */
+      const idx = this.slots.indexOf(slot);
+      if (occupied.has(idx)) continue;
+      this._drawRecessedSlot(c, slot);
+    }
+  }
+  _drawRecessedSlot(c, slot) {
+    c.save();
+    roundRectPath(c, slot.x, slot.y, slot.w, slot.h, 5);
+    const g = c.createLinearGradient(slot.x, slot.y, slot.x, slot.y + slot.h);
+    g.addColorStop(0, CFG.COLORS.SLOT_HOLE_T);
+    g.addColorStop(1, CFG.COLORS.SLOT_HOLE_B);
+    c.fillStyle = g;
+    c.fill();
+    c.strokeStyle = CFG.COLORS.SLOT_RIM; c.lineWidth = 1;
+    c.setLineDash([4, 3]);
+    roundRectPath(c, slot.x + 0.5, slot.y + 0.5, slot.w - 1, slot.h - 1, 5);
+    c.stroke();
+    c.setLineDash([]);
+    c.restore();
+  }
+
+  _drawInventoryPieces() {
+    for (const piece of this.state.inventory) {
+      const slot = this.slotForPiece(piece);
+      if (!slot) continue;
+      this._drawWoodenBlock(
+        { x: slot.x, y: slot.y, w: slot.w, h: slot.h },
+        TEMPLATES[piece.tplId],
+        "inventory"
+      );
+    }
+  }
+
+  /**
+   * Dibuja un bloque de madera con su curva grabada.
+   * mode: "inventory" | "placed" | "drag" | "preview"
+   */
+  _drawWoodenBlock(rect, tpl, mode = "placed", opts = {}) {
+    const c = this.ctx;
+    const { x, y, w, h } = rect;
+
+    /* hueco recessed previo (solo en inventario) */
+    if (mode === "inventory") {
+      c.save();
+      roundRectPath(c, x - 2, y - 1, w + 4, h + 4, 6);
+      c.fillStyle = "rgba(40,22,8,0.4)";
+      c.fill();
+      c.restore();
+    }
+
+    c.save();
+    if (mode === "preview") c.globalAlpha = opts.snapOk ? 0.62 : 0.45;
+
+    if (mode === "drag") {
+      c.shadowColor = "rgba(0,0,0,0.55)"; c.shadowBlur = 22; c.shadowOffsetY = 12;
+    } else if (mode === "placed") {
+      c.shadowColor = "rgba(0,0,0,0.40)"; c.shadowBlur = 8;  c.shadowOffsetY = 3;
+    } else if (mode === "inventory") {
+      c.shadowColor = "rgba(0,0,0,0.30)"; c.shadowBlur = 4;  c.shadowOffsetY = 1;
+    }
+
+    /* cuerpo (degradado de madera clara) */
+    const grad = c.createLinearGradient(x, y, x, y + h);
+    grad.addColorStop(0,    CFG.COLORS.BLOCK_TOP);
+    grad.addColorStop(0.55, CFG.COLORS.BLOCK_MID);
+    grad.addColorStop(1,    CFG.COLORS.BLOCK_BOT);
+    roundRectPath(c, x, y, w, h, 3);
+    c.fillStyle = grad;
+    c.fill();
+    c.restore();
+
+    /* veta interna */
+    c.save();
+    roundRectPath(c, x, y, w, h, 3);
+    c.clip();
+    c.strokeStyle = "rgba(110,72,30,0.22)"; c.lineWidth = 0.7;
+    const gn = Math.max(4, Math.round(w / 18));
+    for (let i = 0; i < gn; i++) {
+      const lx = x + (w * (i + 0.5)) / gn;
+      c.beginPath();
+      c.moveTo(lx, y);
+      c.bezierCurveTo(
+        lx + Math.sin(i * 1.7) * 1.4, y + h * 0.33,
+        lx - Math.sin(i * 2.3) * 1.4, y + h * 0.66,
+        lx + Math.sin(i) * 1.0, y + h
+      );
+      c.stroke();
+    }
+    c.restore();
+
+    /* borde y chaflán */
+    c.lineWidth = CFG.TILE.BORDER;
+    c.strokeStyle = CFG.COLORS.BLOCK_EDGE;
+    roundRectPath(c, x + 0.7, y + 0.7, w - 1.4, h - 1.4, 3);
+    c.stroke();
+    c.strokeStyle = CFG.COLORS.BLOCK_HI; c.lineWidth = 1;
+    c.beginPath();
+    c.moveTo(x + 4, y + 1.5); c.lineTo(x + w - 4, y + 1.5);
+    c.stroke();
+
+    /* curva grabada + label */
+    this._drawCurveInTile(rect, tpl);
+
+    if (mode === "preview") c.globalAlpha = 1;
+  }
+
+  _drawCurveInTile(rect, tpl) {
+    const c = this.ctx;
+    const PAD = CFG.TILE.PAD_PX;
+    const ix = rect.x + PAD, iy = rect.y + PAD;
+    const iw = rect.w - 2 * PAD, ih = rect.h - 2 * PAD;
+
+    const endDx = MathEngine.endDelta(tpl);
+    const samples = 32;
+    const pts = new Array(samples + 1);
+    for (let i = 0; i <= samples; i++) {
+      const dt = (tpl.dur * i) / samples;
+      const dx = MathEngine.delta(tpl, dt);
+      const px = ix + (dt / tpl.dur) * iw;
+      let py;
+      if (Math.abs(endDx) < 1e-6) py = iy + ih / 2;
+      else {
+        const anchorY = endDx > 0 ? iy + ih : iy;
+        const farY    = endDx > 0 ? iy : iy + ih;
+        py = anchorY + (dx / endDx) * (farY - anchorY);
+      }
+      pts[i] = { x: px, y: py };
+    }
+    /* trazo */
+    c.beginPath();
+    for (let i = 0; i < pts.length; i++) {
+      if (i === 0) c.moveTo(pts[i].x, pts[i].y);
+      else         c.lineTo(pts[i].x, pts[i].y);
+    }
+    c.lineWidth = CFG.TILE.INK_W;
+    c.lineCap = "round"; c.lineJoin = "round";
+    c.strokeStyle = CFG.COLORS.INK;
+    c.stroke();
+    /* dots: extremos + medio */
+    [0, samples / 2 | 0, samples].forEach(i => {
+      c.fillStyle = CFG.COLORS.INK;
+      c.beginPath(); c.arc(pts[i].x, pts[i].y, 3, 0, Math.PI * 2); c.fill();
+    });
+    /* label — bottom para curvas hacia abajo, top para arriba */
+    if (tpl.label && ih >= 60) {
+      const fontSize = Math.min(13, Math.max(10, ih * 0.075));
+      c.font = `${fontSize}px "Lucida Console", Consolas, monospace`;
+      c.fillStyle = CFG.COLORS.INK;
+      c.textAlign = "center";
+      if (endDx > 0) {
+        c.textBaseline = "top";
+        c.fillText(tpl.label, ix + iw / 2, iy + 4);
+      } else if (endDx < 0) {
+        c.textBaseline = "bottom";
+        c.fillText(tpl.label, ix + iw / 2, iy + ih - 4);
+      }
+    }
+  }
+
+  /* 6.6 piezas en el tablero */
+  _drawBoardPieces() {
+    for (const piece of this.state.board) {
+      this._drawWoodenBlock(this.boardTileRect(piece),
+                            TEMPLATES[piece.tplId], "placed");
+    }
+  }
+  _drawJoints() {
+    const cont = MathEngine.continuity(this.state.board);
+    const c = this.ctx;
+    cont.joints.forEach(j => {
+      const px = this.tToPx(j.at.t), py = this.xToPy(j.at.x);
+      c.save();
+      c.fillStyle = j.ok ? CFG.COLORS.JOINT_OK : CFG.COLORS.JOINT_BAD;
+      c.shadowColor = j.ok ? "rgba(45,169,79,0.6)" : "rgba(211,71,61,0.6)";
+      c.shadowBlur = 10;
+      c.beginPath(); c.arc(px, py, 5.4, 0, Math.PI * 2); c.fill();
+      c.restore();
+    });
+  }
+
+  _drawSnapPreview() {
+    if (!this.state.drag || !this.state.drag.snap) return;
+    const snap = this.state.drag.snap;
+    const tpl = TEMPLATES[this.state.drag.piece.tplId];
+    const off = this.tileAnchorOffset(tpl);
+    const sz  = this.tileOuterSize(tpl);
+    const ax = this.tToPx(snap.t), ay = this.xToPy(snap.x);
+    const rect = { x: ax - off.dx, y: ay - off.dy, w: sz.w, h: sz.h };
+    const c = this.ctx;
+    c.save();
+    c.fillStyle = snap.ok ? CFG.COLORS.DROP_OK : CFG.COLORS.DROP_NO;
+    roundRectPath(c, rect.x - 5, rect.y - 5, rect.w + 10, rect.h + 10, 7);
+    c.fill();
+    c.restore();
+    this._drawWoodenBlock(rect, tpl, "preview", { snapOk: snap.ok });
+    /* punto anclaje destino */
+    c.save();
+    c.fillStyle = CFG.COLORS.HIGHLIGHT;
+    c.strokeStyle = "#3a2818"; c.lineWidth = 1;
+    c.beginPath(); c.arc(ax, ay, 5, 0, Math.PI * 2);
+    c.fill(); c.stroke();
+    c.restore();
+  }
+
+  _drawDragGhost() {
+    if (!this.state.drag) return;
+    const drag = this.state.drag;
+    const tpl  = TEMPLATES[drag.piece.tplId];
+    const off  = this.tileAnchorOffset(tpl);
+    const sz   = this.tileOuterSize(tpl);
+    const ax = drag.mouseX - drag.gx;
+    const ay = drag.mouseY - drag.gy;
+    const rect = { x: ax - off.dx, y: ay - off.dy, w: sz.w, h: sz.h };
+    this._drawWoodenBlock(rect, tpl, "drag");
+    const c = this.ctx;
+    c.save();
+    c.fillStyle = CFG.COLORS.HIGHLIGHT;
+    c.strokeStyle = "#3a2818"; c.lineWidth = 1;
+    c.beginPath(); c.arc(ax, ay, 4.5, 0, Math.PI * 2);
+    c.fill(); c.stroke();
+    c.restore();
+  }
+
+  _drawBranding() {
+    const c = this.ctx;
+    const { RIGHT, BOTTOM } = CFG.INV;
+    const x = RIGHT - 92, y = BOTTOM + 50;
+    c.font = "italic 800 22px Georgia, serif";
+    c.fillStyle = CFG.COLORS.INK;
+    c.textAlign = "left"; c.textBaseline = "middle";
+    c.fillText("Sika", x, y);
+    /* mini panda */
+    const px = x + 60, py = y;
+    c.fillStyle = "#fff";
+    c.beginPath(); c.arc(px, py, 11, 0, Math.PI * 2); c.fill();
+    c.strokeStyle = "#222"; c.lineWidth = 1; c.stroke();
+    c.fillStyle = "#222";
+    c.beginPath(); c.arc(px - 7, py - 7, 4, 0, Math.PI * 2); c.fill();
+    c.beginPath(); c.arc(px + 7, py - 7, 4, 0, Math.PI * 2); c.fill();
+    c.beginPath(); c.arc(px - 4, py + 1, 1.4, 0, Math.PI * 2); c.fill();
+    c.beginPath(); c.arc(px + 4, py + 1, 1.4, 0, Math.PI * 2); c.fill();
+    c.fillStyle = "#000";
+    c.beginPath(); c.arc(px, py + 4, 1.5, 0, Math.PI * 2); c.fill();
+  }
+
+  _drawHud() {
+    if (this.state.board.length === 0) return;
+    const cont = MathEngine.continuity(this.state.board);
+    const c = this.ctx;
+    c.font = "italic 12px Georgia, serif";
+    c.fillStyle = cont.ok ? "#1f6f33" : "#7a2a25";
+    c.textAlign = "left"; c.textBaseline = "top";
+    const msg = cont.ok
+      ? `✓ Función a trozos continua (${cont.pieces} pieza${cont.pieces !== 1 ? "s" : ""})`
+      : `⚠ Discontinuidad — alinea los extremos`;
+    c.fillText(msg, CFG.GRAPH.LEFT, CFG.GRAPH.BOTTOM + 22);
+  }
+
+  /* 6.7 Hit-tests */
+  pointInGraph(p) {
+    return p.x >= CFG.GRAPH.LEFT && p.x <= CFG.GRAPH.RIGHT &&
+           p.y >= CFG.GRAPH.TOP  && p.y <= CFG.GRAPH.BOTTOM;
+  }
+  pointInSlot(p, slot) { return pointInRect(p, slot); }
+  boardPieceContains(piece, p) {
+    const r = this.boardTileRect(piece);
+    const pad = CFG.HIT_PAD;
+    return p.x >= r.x - pad && p.x <= r.x + r.w + pad &&
+           p.y >= r.y - pad && p.y <= r.y + r.h + pad;
+  }
+}
+
+/* ─── 7. INPUT HANDLER ───────────────────────────────────────── */
+class InputHandler {
+  constructor(canvas, state, renderer) {
+    this.canvas = canvas; this.state = state; this.r = renderer;
+    this.lastPt = { x: 0, y: 0 };
+    this._wire();
+  }
+  _wire() {
+    const md = (e) => { e.preventDefault(); this._down(this._toCanvas(e)); };
+    const mm = (e) => { this._move(this._toCanvas(e)); };
+    const mu = (e) => { this._up(this._toCanvas(e)); };
+    this.canvas.addEventListener("mousedown", md);
+    window.addEventListener("mousemove", mm);
+    window.addEventListener("mouseup", mu);
+    this.canvas.addEventListener("touchstart", (e) => {
+      const t = e.touches[0]; if (!t) return; e.preventDefault();
+      this._down(this._toCanvas({ clientX: t.clientX, clientY: t.clientY }));
+    }, { passive: false });
+    this.canvas.addEventListener("touchmove", (e) => {
+      const t = e.touches[0]; if (!t) return; e.preventDefault();
+      this._move(this._toCanvas({ clientX: t.clientX, clientY: t.clientY }));
+    }, { passive: false });
+    this.canvas.addEventListener("touchend", () => this._up(this.lastPt));
+    this.canvas.addEventListener("dblclick", (e) => {
+      const p = this._toCanvas(e);
+      if (!this.r.pointInGraph(p)) this.state.resetAll();
+    });
+  }
+  _toCanvas(e) {
+    const rect = this.canvas.getBoundingClientRect();
+    const sx = this.canvas.width / rect.width;
+    const sy = this.canvas.height / rect.height;
+    return { x: (e.clientX - rect.left) * sx, y: (e.clientY - rect.top) * sy };
+  }
+
+  _down(p) {
+    this.lastPt = p;
+    if (this.state.drag) return;
+    this.canvas.style.cursor = "grabbing";
+    /* 1) tablero (Z superior) */
+    for (let i = this.state.board.length - 1; i >= 0; i--) {
+      const piece = this.state.board[i];
+      if (this.r.boardPieceContains(piece, p)) {
+        const a = this.r.boardAnchor(piece);
+        this.state.pickupBoard(piece, p.x, p.y, p.x - a.px, p.y - a.py);
+        this._refreshSnap();
+        return;
+      }
+    }
+    /* 2) inventario */
+    for (const piece of this.state.inventory) {
+      const slot = this.r.slotForPiece(piece);
+      if (slot && this.r.pointInSlot(p, slot)) {
+        const a = this.r.inventoryAnchor(piece);
+        this.state.pickupInv(piece, p.x, p.y, p.x - a.px, p.y - a.py);
+        this._refreshSnap();
+        return;
+      }
+    }
+    this.canvas.style.cursor = "default";
+  }
+  _move(p) {
+    this.lastPt = p;
+    if (this.state.drag) {
+      this.state.setDragMouse(p.x, p.y);
+      this._refreshSnap();
+      this.canvas.style.cursor = "grabbing";
+    } else {
+      const overSomething =
+        this.state.board.some(pc => this.r.boardPieceContains(pc, p)) ||
+        this.state.inventory.some(pc => {
+          const s = this.r.slotForPiece(pc);
+          return s && this.r.pointInSlot(p, s);
+        });
+      this.canvas.style.cursor = overSomething ? "grab" : "default";
+    }
+  }
+  _up(p) {
+    if (!this.state.drag) return;
+    this.lastPt = p;
+    const drag = this.state.drag;
+    const ax = drag.mouseX - drag.gx;
+    const ay = drag.mouseY - drag.gy;
+    if (this.r.pointInGraph({ x: ax, y: ay })) {
+      const tpl = TEMPLATES[drag.piece.tplId];
+      const snap = this._computeSnap(this.r.pxToT(ax), this.r.pyToX(ay), tpl);
+      if (snap.ok) this.state.placeBoard(snap.t, snap.x);
+      else         this.state.returnInv();
+    } else {
+      this.state.returnInv();
+    }
+    this.canvas.style.cursor = "default";
+  }
+
+  _refreshSnap() {
+    if (!this.state.drag) return;
+    const drag = this.state.drag;
+    const ax = drag.mouseX - drag.gx;
+    const ay = drag.mouseY - drag.gy;
+    if (!this.r.pointInGraph({ x: ax, y: ay })) {
+      this.state.setDragMouse(drag.mouseX, drag.mouseY, null);
+      return;
+    }
+    const tpl = TEMPLATES[drag.piece.tplId];
+    const snap = this._computeSnap(this.r.pxToT(ax), this.r.pyToX(ay), tpl);
+    this.state.setDragMouse(drag.mouseX, drag.mouseY, snap);
+  }
+
+  _computeSnap(tRaw, xRaw, tpl) {
+    let snapT = Math.round(tRaw / CFG.SNAP.T) * CFG.SNAP.T;
+    let snapX = Math.round(xRaw / CFG.SNAP.X) * CFG.SNAP.X;
+    /* magnetismo a extremos vecinos */
+    const tol2 = CFG.SNAP.JOIN_TOL_PX * CFG.SNAP.JOIN_TOL_PX;
+    let bestD2 = Infinity, bestT = null, bestX = null;
+    for (const p of this.state.board) {
+      const e = MathEngine.end(p, TEMPLATES[p.tplId]);
+      const dpx = this.r.tToPx(e.t) - this.r.tToPx(tRaw);
+      const dpy = this.r.xToPy(e.x) - this.r.xToPy(xRaw);
+      const d2 = dpx * dpx + dpy * dpy;
+      if (d2 < tol2 && d2 < bestD2) { bestD2 = d2; bestT = e.t; bestX = e.x; }
+    }
+    if (bestT !== null) { snapT = bestT; snapX = bestX; }
+    /* validación */
+    const endT = snapT + tpl.dur;
+    const endX = snapX + MathEngine.endDelta(tpl);
+    const fitsT = snapT >= CFG.GRAPH.T_MIN && endT <= CFG.GRAPH.T_MAX;
+    const fitsX =
+      Math.min(snapX, endX) >= CFG.GRAPH.X_MIN &&
+      Math.max(snapX, endX) <= CFG.GRAPH.X_MAX;
+    const overlap = this.state.board.some(p => {
+      const pe = MathEngine.end(p, TEMPLATES[p.tplId]);
+      return Math.max(p.t, snapT) < Math.min(pe.t, endT) - 1e-3;
+    });
+    return { t: snapT, x: snapX, ok: fitsT && fitsX && !overlap };
+  }
+}
+
+/* ─── 8. GAME ────────────────────────────────────────────────── */
+class Game {
+  constructor(canvas) {
+    this.state    = new StateManager();
+    this.renderer = new CanvasRenderer(canvas, this.state);
+    this.input    = new InputHandler(canvas, this.state, this.renderer);
+    this._loop = this._loop.bind(this);
+    requestAnimationFrame(this._loop);
+  }
+  _loop() {
+    if (this.state.dirty) {
+      this.renderer.render();
+      this.state.dirty = false;
+    }
+    requestAnimationFrame(this._loop);
+  }
+}
+
+window.addEventListener("load", () => new Game(document.getElementById("game")));
+</script>
+
+</body>
+</html>
